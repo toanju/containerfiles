@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  packages: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  detect-changes:
+    name: Detect changed images
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.find.outputs.images }}
+      has_changes: ${{ steps.find.outputs.has_changes }}
+    steps:
+      - name: Checkout (full history for tag lookup)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find changed image folders
+        id: find
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          # Determine base SHA to diff against
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE="$PR_BASE_SHA"
+          else
+            BASE="$BEFORE_SHA"
+          fi
+
+          # On initial push or force-push, BEFORE_SHA is all-zeros and doesn't exist.
+          # Fall back to the repository root commit so we diff all files.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE=$(git rev-list --max-parents=0 HEAD)
+          fi
+
+          # Find top-level dirs with a Containerfile that have changed files
+          IMAGES=$(git diff --name-only "$BASE" "$HEAD_SHA" -- \
+            | awk -F/ 'NF>1{print $1}' \
+            | sort -u \
+            | while read -r dir; do
+                [ -f "$dir/Containerfile" ] && echo "$dir"
+              done \
+            | jq -R . | jq -sc .)
+
+          echo "images=$IMAGES" >> "$GITHUB_OUTPUT"
+          if [ "$IMAGES" = "[]" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  compute-versions:
+    name: Compute next versions
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true' && github.event_name == 'push'
+    outputs:
+      versions: ${{ steps.versions.outputs.versions }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute semver per image
+        id: versions
+        env:
+          IMAGES: ${{ needs.detect-changes.outputs.images }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          VERSIONS="{}"
+
+          for IMAGE in $(echo "$IMAGES" | jq -r '.[]'); do
+            # Find latest tag for this image
+            LATEST=$(git tag --list "${IMAGE}/v*" --sort=-v:refname | head -1)
+            if [ -z "$LATEST" ]; then
+              NEW_VERSION="0.1.0"
+              VERSIONS=$(echo "$VERSIONS" | jq -c --arg k "$IMAGE" --arg v "$NEW_VERSION" '. + {($k): $v}')
+              continue
+            fi
+            CURRENT="${LATEST#"${IMAGE}/v"}"
+
+            MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+            MINOR=$(echo "$CURRENT" | cut -d. -f2)
+            PATCH=$(echo "$CURRENT" | cut -d. -f3)
+
+            # Inspect commit messages since last tag
+            COMMITS=$(git log --format="%s%n%b" "${LATEST}..${HEAD_SHA}" -- "$IMAGE")
+
+            if echo "$COMMITS" | grep -q "BREAKING CHANGE" || \
+               echo "$COMMITS" | grep -qE "^(feat|fix|chore|refactor|perf|style|test|docs|build|ci)(\([^)]+\))?!:"; then
+              MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+            elif echo "$COMMITS" | grep -qE "^feat(\([^)]+\))?:"; then
+              MINOR=$((MINOR + 1)); PATCH=0
+            else
+              PATCH=$((PATCH + 1))
+            fi
+
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            VERSIONS=$(echo "$VERSIONS" | jq -c --arg k "$IMAGE" --arg v "$NEW_VERSION" '. + {($k): $v}')
+          done
+
+          echo "versions=$VERSIONS" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.image }}
+    needs: [detect-changes, compute-versions]
+    if: |
+      always() &&
+      needs.detect-changes.result == 'success' &&
+      needs.detect-changes.outputs.has_changes == 'true' &&
+      (needs.compute-versions.result == 'success' || needs.compute-versions.result == 'skipped')
+    strategy:
+      matrix:
+        image: ${{ fromJson(needs.detect-changes.outputs.images) }}
+      fail-fast: false
+    uses: ./.github/workflows/build-image.yml
+    with:
+      image_name: ${{ matrix.image }}
+      version: >-
+        ${{
+          github.event_name == 'push'
+          && fromJson(needs.compute-versions.outputs.versions)[matrix.image]
+          || '0.0.0'
+        }}
+      push: true
+      tag_suffix: >-
+        ${{
+          github.event_name == 'pull_request'
+          && format('pr-{0}', github.event.pull_request.number)
+          || ''
+        }}
+    secrets: inherit
+
+  tag-release:
+    name: Tag release
+    runs-on: ubuntu-latest
+    needs: [detect-changes, compute-versions, build]
+    if: github.event_name == 'push' && needs.build.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create git tags
+        env:
+          IMAGES: ${{ needs.detect-changes.outputs.images }}
+          VERSIONS: ${{ needs.compute-versions.outputs.versions }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          for IMAGE in $(echo "$IMAGES" | jq -r '.[]'); do
+            VERSION=$(echo "$VERSIONS" | jq -r --arg k "$IMAGE" '.[$k]')
+            TAG="${IMAGE}/v${VERSION}"
+            if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}"; then
+              echo "Tag ${TAG} already exists on remote, skipping."
+              continue
+            fi
+            git tag "$TAG" "$HEAD_SHA"
+            git push origin "$TAG"
+          done
