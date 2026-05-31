@@ -1,0 +1,10 @@
+FROM alpine:3.23.4
+
+# renovate: datasource=repology depName=alpine_3_23/unbound versioning=loose
+ARG UNBOUND_VERSION=1.24.2-r0
+
+RUN apk -U add --no-cache \
+  unbound="${UNBOUND_VERSION}"
+
+ENTRYPOINT [ "/usr/sbin/unbound" ]
+CMD [ "-d", "-c", "/etc/unbound/unbound.conf" ]
