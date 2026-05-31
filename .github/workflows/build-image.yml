@@ -1,0 +1,181 @@
+name: Build Image (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Folder name / image name (e.g. unbound)"
+        required: true
+        type: string
+      version:
+        description: "Semver string (e.g. 1.2.3)"
+        required: true
+        type: string
+      push:
+        description: "Push image to registry"
+        required: true
+        type: boolean
+      tag_suffix:
+        description: "Empty for release; pr-<N> for pull requests"
+        required: false
+        type: string
+        default: ""
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image_name }}
+
+jobs:
+  build-amd64:
+    name: Build amd64
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set image tag
+        id: tag
+        env:
+          TAG_SUFFIX: ${{ inputs.tag_suffix }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$TAG_SUFFIX" ]; then
+            echo "tag=${TAG_SUFFIX}-amd64" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${VERSION}-amd64" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate OCI labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # Tag generation is disabled — we supply our own tags above.
+          # metadata-action is used solely for OCI label generation.
+          tags: |
+            type=raw,value=unused,enable=false
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.image_name }}
+          file: ${{ inputs.image_name }}/Containerfile
+          platforms: linux/amd64
+          push: ${{ inputs.push }}
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ inputs.image_name }}-amd64
+          cache-to: type=gha,scope=${{ inputs.image_name }}-amd64,mode=max
+
+  build-arm64:
+    name: Build arm64
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      packages: write
+      contents: read
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set image tag
+        id: tag
+        env:
+          TAG_SUFFIX: ${{ inputs.tag_suffix }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$TAG_SUFFIX" ]; then
+            echo "tag=${TAG_SUFFIX}-arm64" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${VERSION}-arm64" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate OCI labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # Tag generation is disabled — we supply our own tags above.
+          # metadata-action is used solely for OCI label generation.
+          tags: |
+            type=raw,value=unused,enable=false
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.image_name }}
+          file: ${{ inputs.image_name }}/Containerfile
+          platforms: linux/arm64
+          push: ${{ inputs.push }}
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ inputs.image_name }}-arm64
+          cache-to: type=gha,scope=${{ inputs.image_name }}-arm64,mode=max
+
+  merge-manifest:
+    name: Merge multi-arch manifest
+    runs-on: ubuntu-latest
+    needs: [build-amd64, build-arm64]
+    if: inputs.push
+    permissions:
+      packages: write
+    steps:
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set manifest tag(s)
+        env:
+          TAG_SUFFIX: ${{ inputs.tag_suffix }}
+          VERSION: ${{ inputs.version }}
+          IMAGE: ${{ env.IMAGE }}
+        run: |
+          # Write one tag per line to a temp file to avoid word-splitting injection.
+          if [ -n "$TAG_SUFFIX" ]; then
+            printf '%s\n' "${IMAGE}:${TAG_SUFFIX}" > /tmp/manifest_tags
+          else
+            printf '%s\n' "${IMAGE}:${VERSION}" "${IMAGE}:latest" > /tmp/manifest_tags
+          fi
+
+      - name: Create and push multi-arch manifest
+        env:
+          DIGEST_AMD64: ${{ needs.build-amd64.outputs.digest }}
+          DIGEST_ARM64: ${{ needs.build-arm64.outputs.digest }}
+          IMAGE: ${{ env.IMAGE }}
+        run: |
+          tag_args=()
+          while IFS= read -r t; do tag_args+=(--tag "$t"); done < /tmp/manifest_tags
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            "${IMAGE}@${DIGEST_AMD64}" \
+            "${IMAGE}@${DIGEST_ARM64}"
