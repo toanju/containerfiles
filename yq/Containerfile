@@ -1,0 +1,9 @@
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+
+# renovate: datasource=repology depName=alpine_3_24/yq-go versioning=loose
+ARG YQ_VERSION=4.53.3-r0
+
+RUN apk -U add --no-cache \
+  yq-go="${YQ_VERSION}"
+
+ENTRYPOINT [ "/usr/bin/yq" ]
